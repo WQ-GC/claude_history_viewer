@@ -1,2 +1,2 @@
 @echo off
-start "" py "%~dp0server.py"
+start "" pythonw "%~dp0server.py"

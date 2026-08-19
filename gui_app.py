@@ -16,6 +16,7 @@ from server import (
     project_display_name,
     session_title,
     group_into_turns,
+    collapse_blank_lines,
 )
 
 MONOKAI = {
@@ -40,26 +41,38 @@ TOOL_TEXT_CAP = 3000
 class ScrollableFrame(ttk.Frame):
     """A vertically scrollable frame (canvas + inner frame + scrollbar)."""
 
-    def __init__(self, parent, **kw):
+    def __init__(self, parent, on_width_change=None, on_near_bottom=None, **kw):
         super().__init__(parent, **kw)
+        self.on_width_change = on_width_change
+        self.on_near_bottom = on_near_bottom
         self.canvas = tk.Canvas(self, bg=M["bg"], highlightthickness=0)
-        vsb = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.vsb = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
         self.inner = tk.Frame(self.canvas, bg=M["bg"])
         self.inner.bind(
             "<Configure>",
             lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")),
         )
         self._win = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
-        self.canvas.configure(yscrollcommand=vsb.set)
-        self.canvas.bind(
-            "<Configure>", lambda e: self.canvas.itemconfigure(self._win, width=e.width)
-        )
+        self.canvas.configure(yscrollcommand=self._on_yscroll)
+        self.canvas.bind("<Configure>", self._on_canvas_configure)
         self.canvas.pack(side="left", fill="both", expand=True)
-        vsb.pack(side="right", fill="y")
+        self.vsb.pack(side="right", fill="y")
         self.canvas.bind_all("<MouseWheel>", self._on_wheel)
+
+    def _on_canvas_configure(self, event):
+        self.canvas.itemconfigure(self._win, width=event.width)
+        if self.on_width_change is not None:
+            self.on_width_change(event.width)
+
+    def _on_yscroll(self, first, last):
+        self.vsb.set(first, last)
+        if self.on_near_bottom is not None and float(last) > 0.85:
+            self.on_near_bottom()
 
     def _on_wheel(self, event):
         self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        if self.on_near_bottom is not None and float(self.vsb.get()[1]) > 0.85:
+            self.on_near_bottom()
 
     def clear(self):
         for w in self.inner.winfo_children():
@@ -110,8 +123,56 @@ class App(tk.Tk):
         self.current_path = None
         self.current_folder = None
 
+        # avg pixel width of the body font, used to convert the desired
+        # pixel width (80% of the pane) into a Text widget's char-based width
+        self._char_px = tkfont.Font(family="Segoe UI", size=10).measure("0")
+        self.bubble_chars = 90  # replaced by the first canvas <Configure> event
+        self._resize_after_id = None
+
+        # lazy-loading state for the currently open session
+        self._turns = []           # all turns parsed for current session
+        self._rendered_count = 0   # how many turns are actually built as widgets
+        self._bubble_texts = []    # every tk.Text bubble currently on screen
+        self._load_more_pending = False
+        self.PAGE_SIZE = 8
+
         self._build_layout()
         self.populate_tree()
+
+    # ------------------------------------------------------------- resizing
+    def _on_canvas_width_change(self, width_px):
+        if self._resize_after_id is not None:
+            self.after_cancel(self._resize_after_id)
+        self._resize_after_id = self.after(250, lambda: self._apply_bubble_width(width_px))
+
+    def _apply_bubble_width(self, width_px):
+        self._resize_after_id = None
+        chars = max(20, int(width_px * 0.8 / self._char_px))
+        if chars == self.bubble_chars or not self._bubble_texts:
+            self.bubble_chars = chars
+            return
+        self.bubble_chars = chars
+        # cheap path: reconfigure existing bubbles in place instead of
+        # re-reading the file and rebuilding every widget from scratch
+        for t in self._bubble_texts:
+            try:
+                t.configure(width=chars)
+            except tk.TclError:
+                pass
+        self._refit_bubbles_idle(0)
+
+    def _refit_bubbles_idle(self, i):
+        # re-wrap in small batches via after_idle so a long session doesn't
+        # freeze the UI for the whole duration of a resize
+        CHUNK = 25
+        end = min(i + CHUNK, len(self._bubble_texts))
+        for t in self._bubble_texts[i:end]:
+            try:
+                fit_height(t, max_lines=40 if str(t.cget("wrap")) == "none" else 200)
+            except tk.TclError:
+                pass
+        if end < len(self._bubble_texts):
+            self.after_idle(lambda: self._refit_bubbles_idle(end))
 
     # ---------------------------------------------------------------- style
     def _setup_style(self):
@@ -139,13 +200,22 @@ class App(tk.Tk):
 
     # --------------------------------------------------------------- layout
     def _build_layout(self):
-        paned = ttk.PanedWindow(self, orient="horizontal")
+        # plain tk.PanedWindow (not ttk) so the sash is a visible, easily
+        # grabbable drag handle for resizing the left panel
+        paned = tk.PanedWindow(
+            self,
+            orient="horizontal",
+            bg=M["border"],
+            sashwidth=6,
+            sashrelief="flat",
+            bd=0,
+            opaqueresize=True,
+        )
         paned.pack(fill="both", expand=True)
 
         # --- left: search + tree ---
-        left = ttk.Frame(paned, width=380)
-        left.pack_propagate(False)
-        paned.add(left, weight=0)
+        left = tk.Frame(paned, bg=M["bg"])
+        paned.add(left, width=380, minsize=220, stretch="never")
 
         search_row = ttk.Frame(left)
         search_row.pack(fill="x", padx=6, pady=6)
@@ -170,8 +240,8 @@ class App(tk.Tk):
         self.search_var.trace_add("write", lambda *a: self.populate_tree())
 
         # --- right: toolbar + scrollable conversation ---
-        right = ttk.Frame(paned)
-        paned.add(right, weight=1)
+        right = tk.Frame(paned, bg=M["bg"])
+        paned.add(right, minsize=500, stretch="always")
 
         toolbar = tk.Frame(right, bg=M["bg"])
         toolbar.pack(fill="x", padx=14, pady=(12, 4))
@@ -204,10 +274,13 @@ class App(tk.Tk):
             anchor="w",
         ).pack(fill="x", padx=14)
 
-        self.scroll = ScrollableFrame(right)
+        self.scroll = ScrollableFrame(
+            right,
+            on_width_change=self._on_canvas_width_change,
+            on_near_bottom=self._maybe_load_more,
+        )
         self.scroll.pack(fill="both", expand=True, padx=6, pady=6)
         self.scroll.inner.columnconfigure(0, weight=1)
-        self.scroll.inner.columnconfigure(1, weight=1)
 
     def _add_placeholder(self, entry, text):
         entry.insert(0, text)
@@ -290,17 +363,35 @@ class App(tk.Tk):
     # --------------------------------------------------------------- render
     def render_session(self, path):
         self.scroll.clear()
+        self._bubble_texts = []
+        self._load_more_pending = False
         records = read_jsonl(path)
         title = session_title(records)
         self.title_var.set(title)
-        self.meta_var.set(f"{self.current_folder} · {path.name}")
 
-        turns = group_into_turns(records)
-        for i, turn in enumerate(turns, 1):
-            self._render_turn(i, turn)
+        self._turns = group_into_turns(records)
+        self._rendered_count = 0
+        self.meta_var.set(
+            f"{self.current_folder} · {path.name} · {len(self._turns)} turns"
+        )
+        self._render_next_batch()
+
+    def _render_next_batch(self):
+        start = self._rendered_count
+        end = min(start + self.PAGE_SIZE, len(self._turns))
+        for i in range(start, end):
+            self._render_turn(i + 1, self._turns[i])
+        self._rendered_count = end
+        self._load_more_pending = False
+
+    def _maybe_load_more(self):
+        if self._load_more_pending or self._rendered_count >= len(self._turns):
+            return
+        self._load_more_pending = True
+        self.after_idle(self._render_next_batch)
 
     def _render_turn(self, idx, turn):
-        row = idx * 2 - 1  # leave room for a separator row after each turn
+        row = (idx - 1) * 4  # 4 rows per turn: label, prompt, response, separator
         num_lbl = tk.Label(
             self.scroll.inner,
             text=f"TURN {idx}",
@@ -309,22 +400,25 @@ class App(tk.Tk):
             font=("Segoe UI", 8, "bold"),
             anchor="w",
         )
-        num_lbl.grid(row=row - 1, column=0, columnspan=2, sticky="w", padx=4, pady=(10, 2))
+        num_lbl.grid(row=row, column=0, sticky="w", padx=4, pady=(10, 2))
 
+        # prompt: left-aligned bubble, 80% of the pane width
         prompt_txt = make_readonly_text(self.scroll.inner, M["prompt_bg"], M["fg"])
-        prompt_txt.grid(row=row, column=0, sticky="new", padx=(4, 6), pady=2)
+        prompt_txt.configure(width=self.bubble_chars)
+        prompt_txt.grid(row=row + 1, column=0, sticky="w", padx=(4, 4), pady=2)
         prompt_content = turn["prompt"] or "(no prompt — tool-only turn)"
         prompt_txt.insert("1.0", prompt_content)
         prompt_txt.configure(state="disabled")
         fit_height(prompt_txt)
+        self._bubble_texts.append(prompt_txt)
 
+        # response: right-aligned stack of bubbles
         resp_frame = tk.Frame(self.scroll.inner, bg=M["bg"])
-        resp_frame.grid(row=row, column=1, sticky="new", padx=(6, 4), pady=2)
-        resp_frame.columnconfigure(0, weight=1)
+        resp_frame.grid(row=row + 2, column=0, sticky="e", padx=(4, 4), pady=2)
         self._render_response(resp_frame, turn["items"])
 
         sep = tk.Frame(self.scroll.inner, bg=M["border"], height=1)
-        sep.grid(row=row + 1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        sep.grid(row=row + 3, column=0, sticky="ew", pady=(10, 0))
 
     def _render_response(self, parent, items):
         r = 0
@@ -338,17 +432,20 @@ class App(tk.Tk):
             for block in blocks:
                 widget = self._block_widget(parent, block)
                 if widget is not None:
-                    widget.grid(row=r, column=0, sticky="new", pady=(0, 6))
+                    if isinstance(widget, tk.Text):
+                        widget.configure(width=self.bubble_chars)
+                    widget.grid(row=r, column=0, sticky="e", pady=(0, 6))
                     if isinstance(widget, tk.Text):
                         fit_height(
                             widget,
                             max_lines=40 if str(widget.cget("wrap")) == "none" else 200,
                         )
+                        self._bubble_texts.append(widget)
                     r += 1
                     any_content = True
         if not any_content:
             lbl = tk.Label(parent, text="(no content)", bg=M["bg"], fg=M["muted"])
-            lbl.grid(row=0, column=0, sticky="w")
+            lbl.grid(row=0, column=0, sticky="e")
 
     def _block_widget(self, parent, block):
         btype = block.get("type") if isinstance(block, dict) else None
@@ -377,6 +474,7 @@ class App(tk.Tk):
                 inp = _json.dumps(block.get("input", {}), indent=2, ensure_ascii=False)
             except Exception:
                 inp = str(block.get("input"))
+            inp = collapse_blank_lines(inp)
             if len(inp) > TOOL_TEXT_CAP:
                 inp = inp[:TOOL_TEXT_CAP] + "\n... (truncated)"
             t = make_readonly_text(parent, M["bg_alt"], M["fg"], wrap="none")
@@ -406,7 +504,7 @@ class App(tk.Tk):
                         text = _json.dumps(content, indent=2, ensure_ascii=False)
                     except Exception:
                         text = str(content)
-            text = text or ""
+            text = collapse_blank_lines(text or "")
             if len(text) > TOOL_TEXT_CAP:
                 text = text[:TOOL_TEXT_CAP] + "\n... (truncated)"
             t = make_readonly_text(parent, M["bg_alt"], M["fg"], wrap="none")
@@ -446,6 +544,9 @@ class App(tk.Tk):
             if parent and not self.tree.get_children(parent):
                 self.tree.delete(parent)
         self.scroll.clear()
+        self._bubble_texts = []
+        self._turns = []
+        self._rendered_count = 0
         self.title_var.set("Select a session")
         self.meta_var.set("")
         self.current_path = None

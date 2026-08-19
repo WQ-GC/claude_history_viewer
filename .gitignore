@@ -1,6 +1,5 @@
 __pycache__/
 *.pyc
 static/
-server.log
-gui.log
+*.log
 *.png

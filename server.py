@@ -142,6 +142,26 @@ def session_title(records, max_len=70):
     return "(untitled session)"
 
 
+def collapse_blank_lines(text, max_consecutive=2):
+    """Normalize CRLF and squash long runs of blank/whitespace-only lines,
+    so command output padded with blank lines (progress bars, trailing
+    whitespace) doesn't render as a huge mostly-empty box."""
+    if not text:
+        return text
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    out = []
+    blank_run = 0
+    for line in lines:
+        if line.strip() == "":
+            blank_run += 1
+            if blank_run <= max_consecutive:
+                out.append(line)
+        else:
+            blank_run = 0
+            out.append(line)
+    return "\n".join(out)
+
+
 def text_of_content(content):
     """Flatten a message content field (str or list of blocks) to plain text."""
     if isinstance(content, str):
@@ -175,6 +195,7 @@ def render_block(block):
             inp = json.dumps(block.get("input", {}), indent=2, ensure_ascii=False)
         except Exception:
             inp = str(block.get("input"))
+        inp = collapse_blank_lines(inp)
         inp = inp if len(inp) < 4000 else inp[:4000] + "\n... (truncated)"
         return (
             f'<details class="tool"><summary>🔧 {name}</summary>'
@@ -188,7 +209,7 @@ def render_block(block):
                 text = json.dumps(content, indent=2, ensure_ascii=False)
             except Exception:
                 text = str(content)
-        text = text or ""
+        text = collapse_blank_lines(text or "")
         text = text if len(text) < 4000 else text[:4000] + "\n... (truncated)"
         return (
             f'<details class="tool"><summary>↳ tool result</summary>'

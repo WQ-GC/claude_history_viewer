@@ -553,7 +553,7 @@ class App(tk.Tk):
         ).pack(side="right", padx=(0, 6))
         self.claude_btn = ttk.Button(
             toolbar,
-            text="▶ Claude CLI",
+            text="▶ Resume in CLI",
             command=self.open_claude_cli,
             state="disabled",
         )
@@ -761,19 +761,21 @@ class App(tk.Tk):
 
     # ------------------------------------------------------------ claude cli
     def open_claude_cli(self):
-        """Open a terminal running the `claude` CLI in this session's own
-        working directory. Prefers Windows Terminal (`wt`); falls back to a
-        bare console window if it isn't installed."""
+        """Open a terminal that resumes this session with
+        `claude --resume <session-id>`, run in the session's own working
+        directory (that's where Claude Code looks up the conversation). The
+        session id is the .jsonl file's name. Prefers Windows Terminal
+        (`wt`); falls back to a bare console window if it isn't installed."""
         cwd = self.current_cwd
         if not cwd:
             messagebox.showwarning(
-                "Claude CLI",
+                "Resume in CLI",
                 "This session didn't record a working directory.",
             )
             return
         if not os.path.isdir(cwd):
             if not messagebox.askyesno(
-                "Claude CLI",
+                "Resume in CLI",
                 f"This session's recorded folder no longer exists:\n\n{cwd}\n\n"
                 "Pick its new location?",
             ):
@@ -786,11 +788,13 @@ class App(tk.Tk):
             cwd = normalize_cwd(os.path.normpath(picked))
             self._cwd_overrides[str(self.current_path)] = cwd
             self.current_cwd = cwd
+        session_id = self.current_path.stem
         # `cmd /k` keeps the window open after claude exits so any final
-        # output stays readable.
+        # output (or a "no conversation found" error) stays readable.
+        cli = ["claude", "--resume", session_id]
         try:
             subprocess.Popen(
-                ["wt", "-d", cwd, "cmd", "/k", "claude"],
+                ["wt", "-d", cwd, "cmd", "/k", *cli],
                 cwd=cwd,
                 creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
             )
@@ -798,16 +802,16 @@ class App(tk.Tk):
         except FileNotFoundError:
             pass
         except Exception as e:
-            messagebox.showerror("Claude CLI", str(e))
+            messagebox.showerror("Resume in CLI", str(e))
             return
         try:
             subprocess.Popen(
-                ["cmd", "/k", "claude"],
+                ["cmd", "/k", *cli],
                 cwd=cwd,
                 creationflags=subprocess.CREATE_NEW_CONSOLE,
             )
         except Exception as e:
-            messagebox.showerror("Claude CLI", f"Couldn't launch a terminal:\n{e}")
+            messagebox.showerror("Resume in CLI", f"Couldn't launch a terminal:\n{e}")
 
     # -------------------------------------------------------------- relocate
     def relocate_project(self):

@@ -791,7 +791,10 @@ class App(tk.Tk):
         session_id = self.current_path.stem
         # `cmd /k` keeps the window open after claude exits so any final
         # output (or a "no conversation found" error) stays readable.
-        cli = ["claude", "--resume", session_id]
+        # --chrome: enable the Claude in Chrome integration for the session.
+        # --remote-control: make the resumed session controllable from other
+        # devices/sessions.
+        cli = ["claude", "--resume", session_id, "--chrome", "--remote-control"]
         try:
             subprocess.Popen(
                 ["wt", "-d", cwd, "cmd", "/k", *cli],

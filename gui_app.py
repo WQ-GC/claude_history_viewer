@@ -761,28 +761,26 @@ class App(tk.Tk):
 
     # ------------------------------------------------------------ claude cli
     @staticmethod
-    def _ensure_chrome_running():
-        """`claude --chrome` attaches to an already-running Chrome; it never
-        launches one. Start a single Chrome window if none is open, so the
-        integration has something to connect to. No-op when Chrome is
-        already running (avoids stacking a new window on every launch)."""
+    def _chrome_running():
         try:
             out = subprocess.run(
                 ["tasklist", "/fi", "imagename eq chrome.exe", "/nh"],
                 capture_output=True, text=True, timeout=5,
             ).stdout.lower()
-            if "chrome.exe" not in out:
-                subprocess.Popen(["cmd", "/c", "start", "", "chrome"])
+            return "chrome.exe" in out
         except Exception:
-            pass
+            return False
 
     def open_claude_cli(self):
-        """Open a terminal that resumes this session with
-        `claude --resume <session-id>`, run in the session's own working
-        directory (that's where Claude Code looks up the conversation). The
-        session id is the .jsonl file's name. Prefers Windows Terminal
-        (`wt`); falls back to a bare console window if it isn't installed.
-        Also makes sure one Chrome window is open for `--chrome` to use."""
+        """Resume this session in a terminal with
+        `claude --resume <session-id> --chrome --remote-control`, run in the
+        session's own working directory (that's where Claude Code looks up
+        the conversation; the id is the .jsonl file's name).
+
+        `--chrome` attaches to a running Chrome but never launches one, so
+        if no Chrome is open we start one first and wait for it to come up
+        before spawning the CLI. Prefers Windows Terminal (`wt`); falls back
+        to a bare console window."""
         cwd = self.current_cwd
         if not cwd:
             messagebox.showwarning(
@@ -806,13 +804,34 @@ class App(tk.Tk):
             self._cwd_overrides[str(self.current_path)] = cwd
             self.current_cwd = cwd
         session_id = self.current_path.stem
-        self._ensure_chrome_running()
+        cli = ["claude", "--resume", session_id, "--chrome", "--remote-control"]
+
+        if self._chrome_running():
+            self._spawn_cli(cwd, cli)
+            return
+        # start a single Chrome window, then poll (off the paint path via
+        # after()) until it's up before launching the CLI so --chrome has
+        # something to connect to
+        try:
+            subprocess.Popen(["cmd", "/c", "start", "", "chrome"])
+        except Exception:
+            self._spawn_cli(cwd, cli)
+            return
+        self._wait_for_chrome_then(cwd, cli, tries=16)
+
+    def _wait_for_chrome_then(self, cwd, cli, tries):
+        if self._chrome_running():
+            # Chrome's process is up; give the extension / native-messaging
+            # host a moment to register before the CLI tries to attach
+            self.after(1200, lambda: self._spawn_cli(cwd, cli))
+        elif tries <= 0:
+            self._spawn_cli(cwd, cli)  # gave up waiting -- launch anyway
+        else:
+            self.after(500, lambda: self._wait_for_chrome_then(cwd, cli, tries - 1))
+
+    def _spawn_cli(self, cwd, cli):
         # `cmd /k` keeps the window open after claude exits so any final
         # output (or a "no conversation found" error) stays readable.
-        # --chrome: enable the Claude in Chrome integration for the session.
-        # --remote-control: make the resumed session controllable from other
-        # devices/sessions.
-        cli = ["claude", "--resume", session_id, "--chrome", "--remote-control"]
         try:
             subprocess.Popen(
                 ["wt", "-d", cwd, "cmd", "/k", *cli],

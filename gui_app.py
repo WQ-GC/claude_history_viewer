@@ -55,6 +55,20 @@ M = MONOKAI
 TOOL_TEXT_CAP = 3000
 SORT_MODES = (("mtime", "Last modified"), ("name", "Name"), ("size", "Size"))
 
+# A tk.Canvas can't scroll a region taller than ~32767px on Windows (16-bit
+# coordinate limit) -- past that the viewport blits into garbage. Real
+# agentic sessions blow straight through it: a single turn can carry
+# hundreds of tool calls (tens of thousands of px) and a whole session
+# reaches 200k+. So: cap what any one turn renders, and page the turn list
+# so the canvas never holds more than PAGE_PX_BUDGET at once. The web viewer
+# has no such limit -- it's the escape hatch for the full, uncapped view.
+MAX_IMAGES_PER_TURN = 6
+MAX_TOOLS_PER_TURN = 20
+PAGE_PX_BUDGET = 18000   # stop adding turns to a page once it reaches this
+PAGE_PX_HARD = 30000     # never let a page exceed this (roll the last turn over)
+MAX_BUBBLE_LINES_WRAP = 120
+MAX_BUBBLE_LINES_NONE = 40
+
 
 class ScrollableFrame(ttk.Frame):
     """A vertically scrollable frame (canvas + inner frame + scrollbar)."""
@@ -369,10 +383,18 @@ class App(tk.Tk):
         self._rendered_count = 0   # how many turns are actually built as widgets
         self._bubble_texts = []    # every tk.Text bubble currently on screen
         self._image_refs = []      # PhotoImage refs for the current session (avoid GC)
-        self._load_more_pending = False
-        self._rendering_batch = False
+        self._img_budget_left = MAX_IMAGES_PER_TURN   # reset per turn in _render_turn
+        self._tool_budget_left = MAX_TOOLS_PER_TURN
+        self._img_dropped = 0
+        self._tools_dropped = 0
         self._render_generation = 0
-        self.PAGE_SIZE = 8
+        # pagination: canvas can't hold a whole big session, so turns are
+        # shown a page at a time. _page_starts[_page_idx] is the first turn
+        # index of the page currently on screen; _page_end is one past its
+        # last. Boundaries are discovered as you page forward.
+        self._page_starts = [0]
+        self._page_idx = 0
+        self._page_end = 0
 
         self.zoom_scale = 1.0  # 1.0 == 100%; persists across sessions until changed
 
@@ -439,7 +461,7 @@ class App(tk.Tk):
         self.update_idletasks()
         for t in self._bubble_texts[i:end]:
             try:
-                fit_height(t, max_lines=40 if str(t.cget("wrap")) == "none" else 200)
+                fit_height(t, max_lines=MAX_BUBBLE_LINES_NONE if str(t.cget("wrap")) == "none" else MAX_BUBBLE_LINES_WRAP)
             except tk.TclError:
                 pass
         if end < len(self._bubble_texts):
@@ -604,6 +626,23 @@ class App(tk.Tk):
             font=("Segoe UI", 9),
             anchor="w",
         ).pack(fill="x", padx=14)
+
+        # page navigation -- only packed (shown) when a session spans more
+        # than one page
+        self._pagenav = tk.Frame(right, bg=M["bg"])
+        self._prev_btn = ttk.Button(
+            self._pagenav, text="◀ Prev", width=8, command=self.prev_page
+        )
+        self._prev_btn.pack(side="left")
+        self._next_btn = ttk.Button(
+            self._pagenav, text="Next ▶", width=8, command=self.next_page
+        )
+        self._next_btn.pack(side="left", padx=(6, 0))
+        self._page_var = tk.StringVar(value="")
+        tk.Label(
+            self._pagenav, textvariable=self._page_var, bg=M["bg"], fg=M["muted"],
+            font=("Segoe UI", 9),
+        ).pack(side="left", padx=10)
 
         self._build_find_bar(right)
 
@@ -982,15 +1021,12 @@ class App(tk.Tk):
 
     # --------------------------------------------------------------- render
     def render_session(self, path):
-        self.scroll.clear()
+        self._render_generation += 1
         self._bubble_texts = []
         self._image_refs = []
-        self._load_more_pending = False
-        self._rendering_batch = False
         self._find_matches = []
         self._find_current = -1
         self.find_status_var.set("")
-        self._render_generation += 1
         records = read_jsonl(path)
         title = session_title(records)
         self.title_var.set(title)
@@ -1001,122 +1037,116 @@ class App(tk.Tk):
         self.claude_btn.configure(state="normal" if self.current_cwd else "disabled")
 
         self._turns = group_into_turns(records)
-        self._rendered_count = 0
-        self._session_meta_base = f"{self.current_folder} · {path.name} · {len(self._turns)} turns"
-        self._update_load_status()
-        self._render_next_batch()
-        self._update_load_status()
-        # paint the first screenful immediately -- update_idletasks() alone
-        # lays the widgets out but never draws them
-        try:
-            self.scroll.canvas.update()
-        except tk.TclError:
-            pass
-        self._continue_background_render(self._render_generation)
+        self._session_meta_base = (
+            f"{self.current_folder} · {path.name} · {len(self._turns)} turns"
+        )
+        self._page_starts = [0]
+        self._page_idx = 0
+        self._render_page()
         if self.find_frame.winfo_ismapped() and self.find_var.get():
-            self._ensure_fully_rendered()
             self._run_find()
 
-    def _render_next_batch(self):
-        # reentrancy guard: _fit_new_bubbles() below calls update_idletasks(),
-        # which flushes the *whole app's* pending idle queue -- including a
-        # scrollregion-triggered "near bottom" check that can fire mid-call,
-        # before self._rendered_count has been updated for the batch still
-        # being rendered here. Without this guard that reentrant call reuses
-        # the stale (pre-update) start/end range and re-renders the same
-        # turns on top of themselves, producing duplicate, overlapping
-        # widgets in the same grid cells.
-        if self._rendering_batch:
-            return
-        self._rendering_batch = True
-        try:
-            start = self._rendered_count
-            end = min(start + self.PAGE_SIZE, len(self._turns))
+    def _render_page(self):
+        """Render one page of turns -- as many as fit in PAGE_PX_BUDGET,
+        starting at self._page_starts[self._page_idx] -- into a freshly
+        cleared canvas. Keeping the canvas well under Tk's ~32767px scroll
+        limit is the whole point; a full big session is 200k+ px and simply
+        cannot be shown at once without the viewport corrupting."""
+        start = self._page_starts[self._page_idx]
+        self.scroll.clear()
+        self._bubble_texts = []
+        self._image_refs = []
+        total = len(self._turns)
+
+        i = start
+        while i < total:
             bubbles_before = len(self._bubble_texts)
-            for i in range(start, end):
-                self._render_turn(i + 1, self._turns[i])
+            images_before = len(self._image_refs)
+            kids_before = set(self.scroll.inner.winfo_children())
+            self._render_turn(i + 1, self._turns[i])
             self._fit_new_bubbles(bubbles_before)
-            self._rendered_count = end
-        finally:
-            self._rendering_batch = False
-            self._load_more_pending = False
+            try:
+                self.update_idletasks()
+                height = self.scroll.inner.winfo_reqheight()
+            except tk.TclError:
+                i += 1
+                break
+            if i == start:
+                # first turn always stays, however tall -- guarantees progress
+                i += 1
+                if height >= PAGE_PX_BUDGET:
+                    break
+                continue
+            if height > PAGE_PX_HARD:
+                # this turn tips the page past what the canvas can scroll --
+                # roll it back and let it start the next page
+                for w in self.scroll.inner.winfo_children():
+                    if w not in kids_before:
+                        w.destroy()
+                del self._bubble_texts[bubbles_before:]
+                del self._image_refs[images_before:]
+                break
+            i += 1
+            if height >= PAGE_PX_BUDGET:
+                break
+        self._page_end = i
+        self._rendered_count = i - start
+
+        # first time we page this far -- remember where the next page starts
+        if self._page_idx == len(self._page_starts) - 1 and i < total:
+            self._page_starts.append(i)
+
+        self._update_page_nav(total)
+        self.scroll.canvas.yview_moveto(0)
+
+    def _update_page_nav(self, total):
+        start = self._page_starts[self._page_idx]
+        if start == 0 and self._page_end >= total:
+            if self._pagenav.winfo_ismapped():
+                self._pagenav.pack_forget()
+            self.meta_var.set(self._session_meta_base)
+            return
+        if not self._pagenav.winfo_ismapped():
+            self._pagenav.pack(fill="x", padx=14, pady=(0, 4), before=self.scroll)
+        self._prev_btn.configure(state="normal" if self._page_idx > 0 else "disabled")
+        self._next_btn.configure(
+            state="normal" if self._page_end < total else "disabled"
+        )
+        self._page_var.set(f"turns {start + 1}–{self._page_end} of {total}")
+        self.meta_var.set(
+            self._session_meta_base + "  ·  paged — the web viewer shows all at once"
+        )
+
+    def next_page(self):
+        if self._page_end >= len(self._turns):
+            return
+        self._page_idx += 1
+        self._render_page()
+
+    def prev_page(self):
+        if self._page_idx == 0:
+            return
+        self._page_idx -= 1
+        self._render_page()
 
     def _fit_new_bubbles(self, start_index):
         """Size every bubble text widget added since start_index with ONE
         upfront geometry flush instead of one update_idletasks() call per
-        widget -- see fit_height's docstring. This is what turns rendering
-        a large (190-turn) session from ~12s into ~5s."""
+        widget -- see fit_height's docstring."""
         self.update_idletasks()
         for t in self._bubble_texts[start_index:]:
             try:
-                fit_height(t, max_lines=40 if str(t.cget("wrap")) == "none" else 200)
+                fit_height(t, max_lines=MAX_BUBBLE_LINES_NONE if str(t.cget("wrap")) == "none" else MAX_BUBBLE_LINES_WRAP)
             except tk.TclError:
                 pass
 
-    def _continue_background_render(self, generation):
-        """Keep rendering the rest of the session a batch at a time,
-        independent of scroll position. Waiting for the user to scroll near
-        the bottom of whatever happens to be on screen (see
-        _maybe_load_more below) works fine for ordinary turns, but a
-        tool-heavy turn can render hundreds of widgets -- scrolling through
-        just one such batch can take dozens of page-downs before the next
-        batch would ever load, which looks and feels like the session is
-        permanently stuck partway through. `generation` guards against a
-        stale chain from a since-replaced session still trickling in
-        widgets after the user has switched away.
-
-        Uses after(1, ...) rather than after_idle: after_idle drains the
-        *entire* pending idle queue back-to-back with nothing forcing a
-        return to the OS message pump in between. Under real interaction
-        (actual mouse/scroll/paint events competing for the same queue),
-        that starves Windows' repaint handling and can leave stale bitmap
-        regions on screen -- text that LOOKS like it's overlapping even
-        though the widget tree underneath is fully correct. An explicit
-        update_idletasks() before rescheduling flushes geometry/scrollregion
-        and lets pending paint messages actually get processed."""
-        if generation != self._render_generation or self._rendered_count >= len(self._turns):
-            return
-        self._render_next_batch()
-        self._update_load_status()
-        self.update_idletasks()
-        # draw this batch now; without a real paint per batch the canvas can
-        # sit showing stale/blank pixels even after every widget is built
-        try:
-            self.scroll.canvas.update()
-        except tk.TclError:
-            pass
-        self.after(1, lambda: self._continue_background_render(generation))
-
-    def _update_load_status(self):
-        # a big tool-heavy session can take several seconds to fully
-        # render even with batched geometry flushing -- without this,
-        # that looks indistinguishable from the app being stuck
-        total = len(self._turns)
-        if self._rendered_count < total:
-            self.meta_var.set(
-                f"{self._session_meta_base}  ·  loading… {self._rendered_count}/{total}"
-            )
-        else:
-            self.meta_var.set(self._session_meta_base)
-
+    # kept as no-ops: the old lazy/background render is replaced by paging,
+    # so a page is always fully built by the time these would run
     def _maybe_load_more(self):
-        if self._load_more_pending or self._rendered_count >= len(self._turns):
-            return
-        self._load_more_pending = True
-        self.after_idle(self._render_next_batch)
+        pass
 
     def _ensure_fully_rendered(self):
-        if self._rendered_count >= len(self._turns):
-            return
-        self.configure(cursor="watch")
-        self.update_idletasks()
-        try:
-            while self._rendered_count < len(self._turns):
-                self._render_next_batch()
-                self._update_load_status()
-                self.update_idletasks()
-        finally:
-            self.configure(cursor="")
+        pass
 
     # ----------------------------------------------------------------- find
     def open_find(self, event=None):
@@ -1228,7 +1258,7 @@ class App(tk.Tk):
         prompt_content = turn["prompt"] or "(no prompt — tool-only turn)"
         insert_markdown(prompt_txt, prompt_content)
         prompt_txt.configure(state="disabled")
-        # height fitting is deferred to the caller (_render_next_batch),
+        # height fitting is deferred to the caller (_render_page),
         # which flushes geometry once for the whole batch instead of once
         # per widget -- see fit_height's docstring
         self._bubble_texts.append(prompt_txt)
@@ -1236,6 +1266,10 @@ class App(tk.Tk):
         # response: left-aligned stack of bubbles
         resp_frame = tk.Frame(self.scroll.inner, bg=M["bg"])
         resp_frame.grid(row=row + 2, column=0, sticky="w", padx=(4, 4), pady=2)
+        self._img_budget_left = MAX_IMAGES_PER_TURN
+        self._tool_budget_left = MAX_TOOLS_PER_TURN
+        self._img_dropped = 0
+        self._tools_dropped = 0
         self._render_response(resp_frame, turn["items"])
 
         sep = tk.Frame(self.scroll.inner, bg=M["border"], height=1)
@@ -1261,12 +1295,41 @@ class App(tk.Tk):
                         self._bubble_texts.append(widget)
                     r += 1
                     any_content = True
+        if self._img_dropped or self._tools_dropped:
+            bits = []
+            if self._tools_dropped:
+                bits.append(f"{self._tools_dropped} more tool step"
+                            f"{'s' if self._tools_dropped != 1 else ''}")
+            if self._img_dropped:
+                bits.append(f"{self._img_dropped} more image"
+                            f"{'s' if self._img_dropped != 1 else ''}")
+            note = tk.Label(
+                parent,
+                text="✂  " + " and ".join(bits)
+                + " in this turn not shown — open the web viewer for the full set",
+                bg=M["prompt_bg"],
+                fg=M["blue"],
+                font=("Segoe UI", 9, "bold"),
+                padx=10,
+                pady=6,
+            )
+            note.grid(row=r, column=0, sticky="w", pady=(0, 6))
+            r += 1
+            any_content = True
         if not any_content:
             lbl = tk.Label(parent, text="(no content)", bg=M["bg"], fg=M["muted"])
             lbl.grid(row=0, column=0, sticky="w")
 
     def _block_widget(self, parent, block):
         btype = block.get("type") if isinstance(block, dict) else None
+        if btype in ("tool_use", "tool_result"):
+            # keep one turn's tool spam from overflowing the canvas -- past
+            # the budget these collapse into the "N more tool steps" note
+            # that _render_response appends
+            if self._tool_budget_left <= 0:
+                self._tools_dropped += 1
+                return None
+            self._tool_budget_left -= 1
         if btype == "text":
             text = (block.get("text") or "").strip()
             if not text:
@@ -1363,7 +1426,20 @@ class App(tk.Tk):
 
     def _make_image_widget(self, parent, block, max_width=560, max_height=480):
         """Decode a base64 image content block into a preview Label, if
-        Pillow is available; otherwise fall back to a placeholder."""
+        Pillow is available; otherwise fall back to a placeholder. Once a
+        turn has spent its image budget (see MAX_IMAGES_PER_TURN) further
+        images render as a one-line stand-in instead -- this is what keeps a
+        PDF-heavy turn from pushing the canvas past its scrollable height."""
+        if self._img_budget_left <= 0:
+            self._img_dropped += 1
+            return tk.Label(
+                parent,
+                text="\U0001F5BC image hidden — open the web viewer to see it",
+                bg=M["resp_bg"],
+                fg=M["muted"],
+                font=("Segoe UI", 9),
+            )
+        self._img_budget_left -= 1
         source = block.get("source") if isinstance(block, dict) else None
         if isinstance(source, dict) and source.get("type") == "base64" and source.get("data"):
             try:

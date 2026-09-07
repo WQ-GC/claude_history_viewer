@@ -760,12 +760,29 @@ class App(tk.Tk):
         self.relocate_btn.configure(state="normal")
 
     # ------------------------------------------------------------ claude cli
+    @staticmethod
+    def _ensure_chrome_running():
+        """`claude --chrome` attaches to an already-running Chrome; it never
+        launches one. Start a single Chrome window if none is open, so the
+        integration has something to connect to. No-op when Chrome is
+        already running (avoids stacking a new window on every launch)."""
+        try:
+            out = subprocess.run(
+                ["tasklist", "/fi", "imagename eq chrome.exe", "/nh"],
+                capture_output=True, text=True, timeout=5,
+            ).stdout.lower()
+            if "chrome.exe" not in out:
+                subprocess.Popen(["cmd", "/c", "start", "", "chrome"])
+        except Exception:
+            pass
+
     def open_claude_cli(self):
         """Open a terminal that resumes this session with
         `claude --resume <session-id>`, run in the session's own working
         directory (that's where Claude Code looks up the conversation). The
         session id is the .jsonl file's name. Prefers Windows Terminal
-        (`wt`); falls back to a bare console window if it isn't installed."""
+        (`wt`); falls back to a bare console window if it isn't installed.
+        Also makes sure one Chrome window is open for `--chrome` to use."""
         cwd = self.current_cwd
         if not cwd:
             messagebox.showwarning(
@@ -789,6 +806,7 @@ class App(tk.Tk):
             self._cwd_overrides[str(self.current_path)] = cwd
             self.current_cwd = cwd
         session_id = self.current_path.stem
+        self._ensure_chrome_running()
         # `cmd /k` keeps the window open after claude exits so any final
         # output (or a "no conversation found" error) stays readable.
         # --chrome: enable the Claude in Chrome integration for the session.

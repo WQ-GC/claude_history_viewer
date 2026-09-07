@@ -122,6 +122,15 @@ class ScrollableFrame(ttk.Frame):
         for w in self.inner.winfo_children():
             w.destroy()
         self.canvas.yview_moveto(0)
+        self.canvas.configure(scrollregion=(0, 0, 0, 0))
+        # force the now-empty viewport to actually repaint -- otherwise the
+        # previous session's bitmap lingers on screen while the next one
+        # renders, because the render loop only ever calls update_idletasks()
+        # (geometry, no paint) and Windows coalesces the expose events away
+        try:
+            self.canvas.update()
+        except tk.TclError:
+            pass
 
     def scroll_to(self, widget, margin=40):
         """Scroll so `widget` (anywhere inside self.inner, possibly nested
@@ -997,6 +1006,12 @@ class App(tk.Tk):
         self._update_load_status()
         self._render_next_batch()
         self._update_load_status()
+        # paint the first screenful immediately -- update_idletasks() alone
+        # lays the widgets out but never draws them
+        try:
+            self.scroll.canvas.update()
+        except tk.TclError:
+            pass
         self._continue_background_render(self._render_generation)
         if self.find_frame.winfo_ismapped() and self.find_var.get():
             self._ensure_fully_rendered()
@@ -1064,6 +1079,12 @@ class App(tk.Tk):
         self._render_next_batch()
         self._update_load_status()
         self.update_idletasks()
+        # draw this batch now; without a real paint per batch the canvas can
+        # sit showing stale/blank pixels even after every widget is built
+        try:
+            self.scroll.canvas.update()
+        except tk.TclError:
+            pass
         self.after(1, lambda: self._continue_background_render(generation))
 
     def _update_load_status(self):

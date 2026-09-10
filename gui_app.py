@@ -21,7 +21,7 @@ import tempfile
 import tkinter as tk
 from datetime import datetime
 from pathlib import Path
-from tkinter import ttk, messagebox, filedialog, font as tkfont
+from tkinter import ttk, messagebox, filedialog, simpledialog, font as tkfont
 
 from server import (
     PROJECTS_DIR,
@@ -767,12 +767,24 @@ class App(tk.Tk):
             return -f.stat().st_mtime
 
         for folder, files, display_name in folder_entries:
-            session_rows = []
+            # Label the folder by the working directory most of its sessions
+            # actually ran in -- not the newest file's cwd, or relocating a
+            # single outlier session (which bumps its mtime) would relabel
+            # the whole project.
+            cwd_counts = {}
+            candidates = []
             for f in files:
                 records = read_jsonl(f)
-                title = session_title(records)
                 if not any(r.get("type") in ("user", "assistant") for r in records):
                     continue
+                for c, n in session_cwd_counts(records).items():
+                    cwd_counts[c] = cwd_counts.get(c, 0) + n
+                candidates.append((f, session_title(records)))
+            if cwd_counts:
+                display_name = max(cwd_counts, key=cwd_counts.get)
+
+            session_rows = []
+            for f, title in candidates:
                 if query and query not in title.lower() and query not in display_name.lower():
                     continue
                 session_rows.append((f, title))
@@ -902,56 +914,178 @@ class App(tk.Tk):
             messagebox.showerror("Resume in CLI", f"Couldn't launch a terminal:\n{e}")
 
     # -------------------------------------------------------------- relocate
+    def _pick_project_folder(self, new_cwd):
+        """Modal picker: which ~/.claude/projects folder should hold the
+        session file. Rows are the existing project folders, each labelled
+        by the working directory most of its sessions ran in -- folder
+        names are hand-maintained here and don't track `cwd`, so this is a
+        deliberate choice, not something we can derive. The last row makes
+        a brand-new folder from a typed name. Returns a folder Path, or
+        None if cancelled."""
+        rows = []  # (label, folder_path, {cwds recorded in it})
+        for folder in sorted(PROJECTS_DIR.iterdir()):
+            if not folder.is_dir():
+                continue
+            files = list(folder.glob("*.jsonl"))
+            counts = {}
+            for f in files:
+                for c, n in session_cwd_counts(read_jsonl(f)).items():
+                    counts[c] = counts.get(c, 0) + n
+            if counts:
+                top = max(counts, key=counts.get)
+                label = f"{folder.name}   —   {top}   ({len(files)})"
+            else:
+                label = f"{folder.name}   —   (empty)"
+            rows.append((label, folder, set(counts)))
+        rows.sort(key=lambda r: r[0].lower())
+
+        dlg = tk.Toplevel(self)
+        dlg.title("Which project folder holds this session?")
+        dlg.transient(self)
+        dlg.configure(bg=M["bg"])
+        tk.Label(
+            dlg,
+            text=(
+                "File the session under which ~/.claude/projects folder?\n"
+                f"Its cwd will be set to:  {new_cwd}"
+            ),
+            bg=M["bg"], fg=M["fg"], anchor="w", justify="left",
+        ).pack(fill="x", padx=12, pady=(12, 4))
+        lb = tk.Listbox(
+            dlg, width=94, height=min(22, len(rows) + 1),
+            bg=M["bg_alt"], fg=M["fg"], selectbackground=M["prompt_bg"],
+            activestyle="dotbox", highlightthickness=0, borderwidth=0,
+        )
+        for label, _, _ in rows:
+            lb.insert("end", label)
+        lb.insert("end", "＋  New folder (type a name)…")
+        lb.pack(fill="both", expand=True, padx=12)
+
+        # preselect a folder that already records this exact cwd, else the
+        # session's current folder
+        pre = next(
+            (i for i, (_, _, cwds) in enumerate(rows) if new_cwd in cwds),
+            None,
+        )
+        if pre is None:
+            pre = next(
+                (
+                    i for i, (_, folder, _) in enumerate(rows)
+                    if folder == PROJECTS_DIR / self.current_folder
+                ),
+                None,
+            )
+        if pre is not None:
+            lb.selection_set(pre)
+            lb.see(pre)
+
+        result = {"v": None}
+
+        def choose(_e=None):
+            sel = lb.curselection()
+            if not sel:
+                return
+            idx = sel[0]
+            if idx == len(rows):  # "New folder…"
+                name = simpledialog.askstring(
+                    "New project folder",
+                    "Folder name under ~/.claude/projects:",
+                    parent=dlg,
+                )
+                if name and name.strip().strip("/\\"):
+                    result["v"] = PROJECTS_DIR / name.strip().strip("/\\")
+                    dlg.destroy()
+                return
+            result["v"] = rows[idx][1]
+            dlg.destroy()
+
+        lb.bind("<Double-Button-1>", choose)
+        lb.bind("<Return>", choose)
+        btns = tk.Frame(dlg, bg=M["bg"])
+        btns.pack(fill="x", padx=12, pady=12)
+        ttk.Button(btns, text="Cancel", command=dlg.destroy).pack(side="right")
+        ttk.Button(btns, text="Select", command=choose).pack(
+            side="right", padx=(0, 8)
+        )
+        dlg.update_idletasks()
+        dlg.grab_set()
+        dlg.wait_window()
+        return result["v"]
+
     def relocate_project(self):
-        """Re-point every session in this project's history folder at a new
-        directory on disk by rewriting the `cwd` field wherever it still
-        names an old path. The history folder itself is left as-is -- its
-        name is just a label (these get renamed by hand over a project's
-        life and can't be derived from `cwd` reliably), and Claude Code
-        reads a folder's sessions regardless of the per-record cwd. A full
-        copy of the folder is saved under ~/.claude/history_viewer_backups/
-        first; tool outputs and file paths inside the sessions are left
-        untouched."""
+        """Move the selected session to another project. Three things carry
+        the association and all three are re-pointed:
+          1. the `cwd` field inside the session `.jsonl`,
+          2. which ~/.claude/projects/<folder> the `.jsonl` lives in,
+          3. its entries in ~/.claude/history.jsonl (Claude Code's own
+             prompt history, keyed by sessionId -> project).
+        Only this one session is touched -- every other session in either
+        folder, and all tool outputs / file paths inside this session, are
+        left unchanged. Full backups (session file + history.jsonl) are
+        saved under ~/.claude/history_viewer_backups/ first."""
         if not self.current_path:
             return
         folder_path = PROJECTS_DIR / self.current_folder
-        jsonl_files = sorted(folder_path.glob("*.jsonl"))
+        f = self.current_path
 
         recorded = {}
-        for f in jsonl_files:
-            for cwd, n in session_cwd_counts(read_jsonl(f)).items():
-                recorded[cwd] = recorded.get(cwd, 0) + n
+        for cwd, n in session_cwd_counts(read_jsonl(f)).items():
+            recorded[cwd] = recorded.get(cwd, 0) + n
         if not recorded:
             messagebox.showwarning(
-                "Relocate project",
-                "No session in this folder recorded a working directory, so "
-                "there's nothing to re-point.",
+                "Relocate session",
+                "This session didn't record a working directory, so there's "
+                "nothing to re-point.",
             )
             return
 
+        # Part 1: the real directory the session should now point at.
         picked = filedialog.askdirectory(
-            title="Select this project's current location", mustexist=True
+            title="Select this session's new working directory",
+            mustexist=True,
         )
         if not picked:
             return
         new_cwd = normalize_cwd(os.path.normpath(picked))
-        known = set(recorded)  # every cwd this project has ever recorded
+
+        # Part 2: which ~/.claude/projects folder should hold the file.
+        dest_folder = self._pick_project_folder(new_cwd)
+        if dest_folder is None:
+            return
+
+        known = set(recorded)  # every cwd this session has recorded
         stale = {c: n for c, n in recorded.items() if c != new_cwd}
-        if not stale:
+        if not stale and dest_folder == folder_path:
             messagebox.showinfo(
-                "Relocate project", "These sessions already point there."
+                "Relocate session",
+                "This session already points there and is already in that "
+                "project folder.",
             )
             return
 
-        listing = "\n".join(f"  {c}  ({n})" for c, n in sorted(stale.items()))
+        if stale:
+            listing = "\n".join(
+                f"  {c}  ({n})" for c, n in sorted(stale.items())
+            )
+            body = (
+                f"In this one session file, rewrite these recorded working "
+                f"directories:\n\n{listing}\n\nto:\n  {new_cwd}\n\n"
+            )
+        else:
+            body = f"Re-point this session at:\n  {new_cwd}\n\n"
+        if dest_folder != folder_path:
+            body += (
+                f"and move the file into project folder:\n"
+                f"  {dest_folder.name}\n\n"
+            )
+        body += (
+            "Matching entries in ~/.claude/history.jsonl are re-pointed too. "
+            "Every other session, and all tool outputs / file paths inside "
+            "this session, are left unchanged. Backups are saved first.\n\n"
+            "Continue?"
+        )
         if not messagebox.askyesno(
-            "Relocate project?",
-            f"In {len(jsonl_files)} session file(s), rewrite these recorded "
-            f"working directories:\n\n{listing}\n\nto:\n  {new_cwd}\n\n"
-            "The history folder name and all tool outputs / file paths inside "
-            "the sessions are left unchanged. A full backup is saved first.\n\n"
-            "Continue?",
-            icon="warning",
+            "Relocate session?", body, icon="warning"
         ):
             return
 
@@ -961,19 +1095,84 @@ class App(tk.Tk):
             / f"{self.current_folder}-{ts}"
         )
         try:
-            backup_dir.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copytree(folder_path, backup_dir)
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(f, backup_dir / f.name)
         except Exception as e:
             messagebox.showerror(
-                "Relocate project", f"Backup failed -- nothing was changed:\n{e}"
+                "Relocate session", f"Backup failed -- nothing was changed:\n{e}"
             )
             return
 
         hits = 0
         try:
-            for f in jsonl_files:
+            out = []
+            with open(f, "r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    s = line.strip()
+                    if not s:
+                        continue
+                    try:
+                        rec = json.loads(s)
+                    except json.JSONDecodeError:
+                        out.append(s)
+                        continue
+                    rc = rec.get("cwd")
+                    if rc and rc != new_cwd and normalize_cwd(rc) in known:
+                        rec["cwd"] = new_cwd
+                        hits += 1
+                    out.append(
+                        json.dumps(rec, ensure_ascii=False, separators=(",", ":"))
+                    )
+            fd, tmp = tempfile.mkstemp(dir=folder_path, suffix=".tmp")
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write("\n".join(out) + ("\n" if out else ""))
+            os.replace(tmp, f)
+        except Exception as e:
+            messagebox.showerror(
+                "Relocate session",
+                f"Rewrite failed:\n{e}\n\n"
+                f"Your original data is backed up at:\n{backup_dir}",
+            )
+            return
+
+        # Move the file into the project folder the user picked. The folder
+        # name is only a label; sessions in either folder are otherwise
+        # untouched.
+        moved_to = None
+        if dest_folder != folder_path:
+            try:
+                dest_folder.mkdir(parents=True, exist_ok=True)
+                target = dest_folder / f.name
+                if target.exists():
+                    raise FileExistsError(target)
+                shutil.move(str(f), str(target))
+                f = target
+                self.current_path = target
+                self.current_folder = dest_folder.name
+                moved_to = dest_folder.name
+            except Exception as e:
+                messagebox.showwarning(
+                    "Relocate session",
+                    f"The cwd was rewritten, but moving the file into "
+                    f"{dest_folder.name} failed:\n{e}\n\n"
+                    f"The session still works; it just stays grouped under "
+                    f"{folder_path.name}.",
+                )
+
+        # Claude Code keeps its own prompt history in ~/.claude/history.jsonl,
+        # where each entry ties a sessionId to a `project` dir independently
+        # of the session file. Re-point those too, or the resume picker and
+        # recent-prompts still file this session under the old location.
+        session_id = f.stem
+        hist_path = Path.home() / ".claude" / "history.jsonl"
+        hist_hits = 0
+        if hist_path.exists():
+            try:
+                shutil.copy2(hist_path, backup_dir / hist_path.name)
                 out = []
-                with open(f, "r", encoding="utf-8", errors="replace") as fh:
+                with open(
+                    hist_path, "r", encoding="utf-8", errors="replace"
+                ) as fh:
                     for line in fh:
                         s = line.strip()
                         if not s:
@@ -983,24 +1182,29 @@ class App(tk.Tk):
                         except json.JSONDecodeError:
                             out.append(s)
                             continue
-                        rc = rec.get("cwd")
-                        if rc and rc != new_cwd and normalize_cwd(rc) in known:
-                            rec["cwd"] = new_cwd
-                            hits += 1
+                        proj = rec.get("project")
+                        if (
+                            rec.get("sessionId") == session_id
+                            and proj != new_cwd
+                            and normalize_cwd(proj or "") in known
+                        ):
+                            rec["project"] = new_cwd
+                            hist_hits += 1
                         out.append(
-                            json.dumps(rec, ensure_ascii=False, separators=(",", ":"))
+                            json.dumps(
+                                rec, ensure_ascii=False, separators=(",", ":")
+                            )
                         )
-                fd, tmp = tempfile.mkstemp(dir=folder_path, suffix=".tmp")
+                fd, tmp = tempfile.mkstemp(dir=hist_path.parent, suffix=".tmp")
                 with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
                     fh.write("\n".join(out) + ("\n" if out else ""))
-                os.replace(tmp, f)
-        except Exception as e:
-            messagebox.showerror(
-                "Relocate project",
-                f"Rewrite failed partway through:\n{e}\n\n"
-                f"Your original data is backed up at:\n{backup_dir}",
-            )
-            return
+                os.replace(tmp, hist_path)
+            except Exception as e:
+                messagebox.showwarning(
+                    "Relocate session",
+                    f"Session updated, but rewriting history.jsonl failed:"
+                    f"\n{e}",
+                )
 
         self._cwd_overrides.pop(str(self.current_path), None)
         reselect = self.current_path
@@ -1013,9 +1217,12 @@ class App(tk.Tk):
                 self.tree.selection_set(item)
                 self.tree.see(item)
                 break
+        tail = f"\nMoved into project folder:  {moved_to}" if moved_to else ""
+        if hist_hits:
+            tail += f"\nhistory.jsonl entries re-pointed:  {hist_hits}"
         messagebox.showinfo(
-            "Relocate project",
-            f"Done. {hits} record(s) updated across {len(jsonl_files)} file(s).\n\n"
+            "Relocate session",
+            f"Done. {hits} record(s) updated in this session.{tail}\n\n"
             f"Backup: {backup_dir}",
         )
 

@@ -3,3 +3,6 @@ __pycache__/
 static/
 *.log
 *.png
+build/
+dist/
+*.spec

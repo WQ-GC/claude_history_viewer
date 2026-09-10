@@ -18,6 +18,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import traceback
 import tkinter as tk
 from datetime import datetime
 from pathlib import Path
@@ -734,6 +735,13 @@ class App(tk.Tk):
         self.item_kind.clear()
 
         if not PROJECTS_DIR.exists():
+            # portability: on a PC where Claude Code has never run (or runs
+            # under a different home dir) there's simply nothing to show --
+            # say so instead of leaving a blank pane that looks broken
+            msg = self.tree.insert(
+                "", "end", text=f"  No history found at  {PROJECTS_DIR}"
+            )
+            self.item_kind[msg] = "info"
             return
         sort_mode = self._sort_label_to_key.get(self.sort_var.get(), "mtime")
 
@@ -800,6 +808,15 @@ class App(tk.Tk):
                 sid = self.tree.insert(proj_id, "end", text=f"  {title}")
                 self.item_kind[sid] = "session"
                 self.item_path[sid] = (folder.name, f)
+
+        if not self.tree.get_children():
+            text = (
+                "  No sessions match your filter"
+                if query
+                else f"  No sessions found under  {PROJECTS_DIR}"
+            )
+            info = self.tree.insert("", "end", text=text)
+            self.item_kind[info] = "info"
 
     # --------------------------------------------------------------- select
     def on_select(self, _event):
@@ -1742,8 +1759,44 @@ class App(tk.Tk):
         self.render_session(prev_path)
 
 
+def _crash_log_path():
+    base = os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()
+    return Path(base) / "CHistViewer" / "error.log"
+
+
+def _report_crash(exc, tb_obj=None):
+    """Persist a traceback and show it. A --windowed onefile build has no
+    console, so without this a startup failure on another PC is completely
+    silent -- the exe just doesn't appear."""
+    tb = "".join(
+        traceback.format_exception(type(exc), exc, tb_obj or exc.__traceback__)
+    )
+    path = _crash_log_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(f"\n===== {datetime.now().isoformat(timespec='seconds')} =====\n")
+            fh.write(tb)
+    except Exception:
+        pass
+    try:
+        messagebox.showerror(
+            "Claude Code History — error",
+            f"{tb.strip().splitlines()[-1]}\n\nFull details written to:\n{path}",
+        )
+    except Exception:
+        pass
+
+
 def main():
-    app = App()
+    try:
+        app = App()
+    except Exception as e:
+        _report_crash(e)
+        raise
+    # runtime errors inside Tk event callbacks are swallowed by Tk unless
+    # we route them here too
+    app.report_callback_exception = lambda exc, val, tb: _report_crash(val, tb)
     app.mainloop()
 
 
